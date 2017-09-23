@@ -1,0 +1,2636 @@
+#!/usr/bin/perl -w
+#
+# VIT - Visual Interactive Taskwarrior
+#
+# vit-1.3.dev built Sun Sep 24 00:23:28 CEST 2017
+#
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+use strict;
+use Curses;
+use Time::HiRes qw(usleep);
+use Try::Tiny;
+use utf8;
+use POSIX qw(setlocale LC_CTYPE WIFSIGNALED WIFEXITED WEXITSTATUS);
+use I18N::Langinfo qw(langinfo CODESET);
+use Encode;
+use Text::CharWidth qw(mbswidth);
+
+# Clean up terminal on a Perl error or warning. This makes it more clear what
+# the error or warning message is and it leaves the terminal in a usable state.
+$SIG{HUP} = sub { &error_exit("Received signal HUP"); };
+$SIG{INT} = sub { &error_exit("Received signal INT"); };
+$SIG{PIPE} = sub { &error_exit("Received signal PIPE"); };
+$SIG{TERM} = sub { &error_exit("Received signal TERM"); };
+$SIG{__DIE__} = sub { &error_exit(@_); };
+# Exit even on Perl warning
+$SIG{__WARN__} = sub { &error_exit("(converted from warning) "."@_"); };
+
+our $commands_file = '/usr/local/share/vit/commands';
+our $task = '/usr/bin/task';
+our $clear = '/usr/bin/clear';
+if ( $commands_file =~ /^%/ ) { $commands_file = "./commands"; }
+if ( $task =~ /^%/ ) { $task = '/usr/local/bin/task'; }
+if ( $clear =~ /^%/ ) { $clear = '/usr/bin/clear'; }
+
+our $cli_args = '';
+our $audit = 0;
+our @colors2pair;
+our $convergence = '';
+our $current_command = 'unknown';
+our $cursor_position = 'unknown';
+our $default_command = 'next';
+our $display_start_idx = 0;
+our $error_delay = 500000;
+our $error_msg = '';
+our $flash_convergence = 0;
+our $flash_delay = 80000;
+our $header_win;
+our $header_attrs;
+our $input_mode = 'cmd';
+our $num_projects = 0;
+our $num_tasks = 0;
+our $feedback_msg = '';
+our @parsed_tokens = ();
+our @parsed_colors_fg = ();
+our @parsed_colors_bg = ();
+our @parsed_attrs = ();
+our $prev_display_start_idx;
+our $prev_ch = '';
+our $prev_command = 'next';
+our $prev_convergence = '';
+our $prev_task_selected_idx;
+our @project_types = ();
+our @tag_types = ();
+our $prompt_win;
+our $refresh_needed = 0;
+our $reread_needed = 0;
+our $report_descr = 'unknown';
+our $report_win;
+our @report_header_tokens = ();
+our @report_header_colors_fg = ();
+our @report_header_colors_bg = ();
+our @report_header_attrs = ();
+our @report_tokens = ();
+our @report_lines = ();
+our @report_types = ();
+our @report_colors_fg = ();
+our @report_colors_bg = ();
+our @report_attrs = ();
+our @report2taskid = ();
+our $search_direction = 1;
+our $search_pat = undef;
+our $selection_attrs = '';
+our @taskid2report = ();
+our $tasks_completed = 0;
+our $tasks_pending = 0;
+our $task_selected_idx = 0;
+our $titlebar = 0;
+our $version = 'vit-1.3.dev (d72d6e0)';
+our $REPORT_LINES;
+our $REPORT_COLS;
+
+our $COLOR_HEADER = 1;
+our $COLOR_REPORT_HEADER = 2;
+our $COLOR_SELECTION = 3;
+our $COLOR_EMPTY_LINE = 4;
+our $COLOR_ERRORS = 5;
+our $next_color_pair = 6;
+
+our %shortcuts;
+our $cur_pos;
+our %histories;
+
+# are we in a "try" block? If so, quick return from END block
+our $during_try = 0;
+
+# vitrc settings
+my $burndown = "no";
+my $confirmation = 1;
+my $nowait = undef;
+
+
+###################################################################
+## main...
+
+&parse_args();
+&parse_vitrc();
+&init_shell_env();
+&init_curses('init');
+&init_task_env();
+&read_report('init');
+&draw_screen();
+&getch_loop();
+&clean_exit();
+########################################################
+## args.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub parse_args {
+  while ( @ARGV ) {
+    if ( $ARGV[0] eq '--help' || $ARGV[0] eq '-help' || $ARGV[0] eq '-h' ) {
+      &usage();
+    }
+    if ( $ARGV[0] eq '--version' || $ARGV[0] eq '-version' || $ARGV[0] eq '-v' ) {
+      print "$version\n";
+      exit 0;
+    }
+    if ( $ARGV[0] eq '--audit' || $ARGV[0] eq '-audit' || $ARGV[0] eq '-a' ) {
+      $audit = 1;
+      shift @ARGV;
+      next;
+    }
+    if ( $ARGV[0] eq '--titlebar' || $ARGV[0] eq '-titlebar' || $ARGV[0] eq '-t' ) {
+      $titlebar = 1;
+      shift @ARGV;
+      next;
+    }
+    $cli_args .= "$ARGV[0] ";
+    shift @ARGV;
+    next;
+  }
+  if ( $audit ) {
+    open(AUDIT, ">", "vit_audit.log") or die "$!";
+    open STDERR, '>&AUDIT';
+
+    # flush AUDIT after printing to it
+    my $ofh = select AUDIT;
+    $| = 1;
+    select $ofh;
+
+    print AUDIT "$$ INIT $0 " . join(' ',@ARGV), "\r\n";
+  }
+}
+
+#------------------------------------------------------------------
+
+sub usage {
+  print "usage: vit [switches] [task_args]\n";
+  print "  -audit     print task commands to vit_audit.log\n";
+  print "  -titlebar  sets the xterm titlebar to \"$version\"\n";
+  print "  -version  prints the version\n";
+  print "  task_args  any set of task commandline args that print an \"ID\" column\n";
+  exit 0;
+}
+
+
+########################################################
+## cmdline.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub cmd_line {
+  &audit("Inside of cmd_line");
+  my ($prompt) = @_;
+  my $str = &prompt_str($prompt);
+  if ( $str eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+  if ( $str =~ /^!(.*)/ ) {
+    my $rtn = &shell_command($1);
+    return;
+  }
+  if ( $str =~ /^\d+$/ ) {
+    if ( ! defined $taskid2report[$str] ) {
+       $error_msg = "Error: task number $str not found";
+       &draw_error_msg();
+       return;
+    }
+    $task_selected_idx = $taskid2report[$str] - 1;
+    if ( $display_start_idx + $REPORT_LINES < $task_selected_idx ) {
+      $display_start_idx = int($task_selected_idx - $REPORT_LINES + ($REPORT_LINES / 2));
+    }
+    if ( $display_start_idx > $task_selected_idx ) {
+      $display_start_idx = int($task_selected_idx - $REPORT_LINES + ($REPORT_LINES / 2));
+      if ( $display_start_idx < 0 ) {
+        $display_start_idx = 0;
+      } elsif ( $display_start_idx > $task_selected_idx) {
+        $display_start_idx = $task_selected_idx;
+      }
+    }
+    &draw_screen();
+    return;
+  }
+  if ( $str =~ /^s\/(.*?)\/(.*)\/$/ || $str =~ /^%s\/(.*?)\/(.*)\/$/ ) {
+    my ($old,$new) = ($1,$2);
+    my $rtn = &task_modify("/$old/$new/");
+    $reread_needed = 1;
+    return;
+  }
+  if ( $str eq 'help' || $str eq 'h' ) {
+    &shell_exec("view $commands_file",'no-wait');
+    return;
+  }
+  if ( $str =~ /^help (.*)/ || $str =~ /^h (.*)/ ) {
+    my $p = $1;
+    my $tmp_file = "/tmp/vit-help.$$";
+    open(IN,"<$commands_file");
+    open(OUT,">$tmp_file");
+    print OUT "\n";
+    while(<IN>) {
+      if ( $_ =~ /$p/ ) {
+        print OUT $_;
+      }
+    }
+    close(IN);
+    print OUT "\n";
+    close(OUT);
+    &shell_exec("view $tmp_file",'no-wait');
+    unlink($tmp_file);
+    return;
+  }
+  if ( $str eq 'q' ) {
+    &clean_exit();
+  }
+  if ( grep(/^$str$/,@report_types) ) {
+    $prev_command = $current_command;
+    $current_command = $str;
+    &read_report('init');
+    &draw_screen();
+    return;
+  }
+  if ( $str =~ /^(.*?) .*/ ) {
+    my $s = $1;
+    if ( grep(/^$s/,@report_types) ) {
+      $prev_command = $current_command;
+      $current_command = $str;
+      &read_report('init');
+      &draw_screen();
+      return;
+    }
+  }
+  $error_msg = "$str: command not found";
+  &draw_error_msg();
+  return;
+}
+
+########################################################
+## cmds.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+#------------------------------------------------------------------
+
+sub prompt_quit {
+  my $yes;
+  if ($confirmation) {
+    $yes = &prompt_y("Quit?");
+    if ( ! $yes ) {
+      &draw_prompt_line('');
+      return;
+    }
+  }
+  &clean_exit()
+}
+
+#------------------------------------------------------------------
+
+sub task_add {
+  my $str = &prompt_str("Add: ");
+  if ( $str eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+  # TODO: get rid off escaping by replacing the shell call in task_exec() by something like IPC::Open2().
+  #       That would allow us to get rid of all shell expansions, quotations and escaping. [BaZo]
+  $str =~ s{[&^\\]}{\\\&}g;
+  my ($es,$result) = &task_exec("add $str");
+  if ( $es != 0 ) {
+    $error_msg = $result;
+    &draw_error_msg();
+    return;
+  }
+  $feedback_msg = $result;
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_annotate {
+  my $id = $report2taskid[$task_selected_idx];
+  my $str = &prompt_str("Annotate: ");
+  if ( $str eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+  # This task_exec is different (from, e.g., the one in task_add)
+  # because for annotatate we embed quotes since there is nothing
+  # else for Taskwarrior to interpret. The advantage is that the
+  # user does not need to worry about proper quoting.
+  #
+  # Because single quotes are the enclosing characters, they must be escaped.
+  # This replaces each single quote inside $str with (1) a single quote to end
+  # the single-quoting, a double quote to begin a new type of quoting, a single
+  # quote (which is now embedded in a double quote so does not need escaping),
+  # an end double-quote, and a begin-single-quote that will begin the rest of
+  # the quoting. In summary, we rely on the sh and bash feature of stringing together multiple types of quotes
+  $str =~ s/'/'"'"'/g;
+  my ($es,$result) = &task_exec("$id annotate '$str'");
+  if ( $es != 0 ) {
+    $error_msg = $result;
+    &draw_error_msg();
+    return;
+  }
+  $feedback_msg = "Annotated task $id.";
+  &draw_feedback_msg();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_den_or_del {
+  my ($ch, $str, $yes);
+  my $id = $report2taskid[$task_selected_idx];
+  for my $t (0 .. $#{ $report_tokens[$task_selected_idx] } ) {
+    $str .= "$report_tokens[$task_selected_idx][$t]";
+  }
+  my $target = ( $str !~ s/^\s*\d+[\/-]\d+[\/-]\d+\s+// )
+             ? "task"
+             : "annotation";
+  $str =~ s/\s+$//;
+  if ($confirmation) {
+    $yes = &prompt_y("Delete current $target? ");
+    if ( ! $yes ) {
+      &draw_prompt_line('');
+      return;
+    }
+  }
+  my ($es,$result) = ($target eq "annotation")
+                   ? &task_exec("$id denotate \"$str\"")
+                   : &task_exec("$id delete rc.confirmation:no");
+  if ( $es != 0 ) {
+    $error_msg = $result;
+    &draw_error_msg();
+    return;
+  }
+  $feedback_msg = "Deleted $target.";
+  &draw_feedback_msg();
+  &flash_current_task();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_start_stop {
+  my ($ch, $str, $yes);
+  my $id = $report2taskid[$task_selected_idx];
+
+  my ($state, $result1) = &task_exec("$id active");
+  my $prompt = "stop";
+  $feedback_msg = "Stopped task";
+
+  if ($state != 0) {
+    $prompt = "start";
+    $feedback_msg = "Started task";
+  }
+
+  if ($confirmation) {
+    $yes = &prompt_y("$prompt task?");
+    if ( ! $yes ) {
+      &draw_prompt_line('');
+      return;
+    }
+  }
+
+  my ($es, $result2) = &task_exec("$id $prompt");
+  if ( $es != 0 ) {
+    $error_msg = $result2;
+    &draw_error_msg();
+    return;
+  }
+
+  &draw_feedback_msg();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_done {
+  my ($ch, $str, $yes);
+  my $id = $report2taskid[$task_selected_idx];
+  if ($confirmation) {
+    $yes = &prompt_y("Mark task $id done? ");
+    if ( ! $yes ) {
+      &draw_prompt_line('');
+      return;
+    }
+  }
+  my ($es,$result) = &task_exec("$id done");
+  if ( $es != 0 ) {
+    $error_msg = $result;
+    &draw_error_msg();
+    return;
+  }
+  $feedback_msg = "Marked task done.";
+  &draw_feedback_msg();
+  &flash_current_task();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_filter {
+  my ($c, $f);
+  if ( $current_command =~ /(.*?)\s+(.*)/ ) {
+    ($c,$f) = ($1,$2);
+  } else {
+    $c = $current_command;
+    $f = '';
+  }
+  my $str = &prompt_str("Filter: $f");
+  if ( $str eq '' ) {
+    &draw_prompt_line('');
+    $current_command = $c;
+    if ( $f ne '' ) { $reread_needed = 1; }
+    return;
+  }
+  $prev_command = $current_command;
+  $current_command = "$c $str";
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_modify {
+  my $args = $_[0];
+  my $id = $report2taskid[$task_selected_idx];
+  &shell_exec("$task $id modify $args",'wait');
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_modify_prompt {
+  my $id = $report2taskid[$task_selected_idx];
+  my $str = &prompt_str("Modify: ");
+  if ( $str eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+  &task_modify("$str");
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_set_priority {
+  my $id = $report2taskid[$task_selected_idx];
+  my $prio = &task_info('Priority');
+  if ( $prio eq '' ) {
+    $prio = 'N';
+  }
+  my $p = &prompt_chr("Change priority (l/m/h/n): ");
+  $p = uc($p);
+  if ( $p ne $prio && $p =~ /[LMHN]/ ) {
+    if ( $p eq 'N' ) {
+      $p = '';
+    }
+    my ($es,$result) = &task_exec("$id modify 'priority:$p'");
+    if ( $es != 0 ) {
+      $error_msg = $result;
+      &draw_error_msg();
+      return;
+    }
+    $feedback_msg = "Modified task $id.";
+    &flash_current_task();
+    $reread_needed = 1;
+  }
+  else {
+    &draw_prompt_line('');
+    return;
+  }
+}
+
+#------------------------------------------------------------------
+
+sub task_set_project {
+  my $id = $report2taskid[$task_selected_idx];
+  my $p = &prompt_str("Project: ");
+  if ( $p eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+  my $proj = &task_info('Project');
+  if ( $p eq $proj ) {
+    beep();
+    return;
+  }
+  my ($es,$result) = &task_exec("$id modify 'project:$p'");
+  if ( $es != 0 ) {
+    $error_msg = $result;
+    &draw_error_msg();
+    return;
+  }
+  $feedback_msg = "Modified task $id.";
+  &flash_current_task();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_set_wait {
+  my $id = $report2taskid[$task_selected_idx];
+  my $w = &prompt_str("Wait: ");
+  if ( $w eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+  my ($es,$result) = &task_exec("$id modify 'wait:$w'");
+  if ( $es != 0 ) {
+    $error_msg = $result;
+    &draw_error_msg();
+    return;
+  }
+  $feedback_msg = "Modified task $id.";
+  &flash_current_task();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_set_tag {
+  my $id = $report2taskid[$task_selected_idx];
+  my $tags = &prompt_str("Tag: ");
+  if ( $tags eq '' ) {
+    &draw_prompt_line('');
+    return;
+  }
+
+  # multiple tags can be specified separated by spaces
+  # keep track of the current modifier (default:+) and use it for subsequent tags
+  # so "+a b c" means "+a +b +c" and "+a -b c" means "+a -b -c"
+  my $mod='+';
+  foreach my $t (split(/\s+/,$tags)) {
+    next if $t =~ m/^\s*$/;
+
+    # check if a + or - was specified
+    my $fc = substr($t,0,1);
+    if ( $fc eq '+'  or  $fc eq '-' ) {
+      # if so, save the current modifier
+      $mod = $fc;
+    } else {
+      # if not, add the current modifier
+      $t = $mod . $t;
+    }
+
+    my ($es,$result) = &task_exec("$id modify '$t'");
+    if ( $es != 0 ) {
+      $error_msg = $result;
+      &draw_error_msg();
+      return;
+    }
+  }
+
+  $feedback_msg = "Modified task $id.";
+  &flash_current_task();
+  $reread_needed = 1;
+}
+
+#------------------------------------------------------------------
+
+sub shell_command {
+  my $args = $_[0];
+  my ($opts, $cmd);
+  if ( $args =~ /([^ ]*) (.+)/ ) {
+    $opts = $1;
+    $cmd = $2;
+  }
+  else {
+    $error_msg = "Empty shell command for ':!'. See help (:h).";
+    &draw_error_msg();
+    return;
+  }
+
+  my $wait = "no-wait";
+  foreach my $l ( split //, $opts ) {
+    if ( $l eq 'r' ) {
+      $reread_needed = 1;
+    } elsif ( $l eq 'w' ) {
+      $wait = "wait";
+    } else {
+      $error_msg = "$l is not a valid command option to ':!'. See help (:h).";
+      &draw_error_msg();
+      return;
+    }
+  }
+
+  $cmd =~ s/%TASKID/$report2taskid[$task_selected_idx]/g;
+  $cmd =~ s/%TASKARGS/$current_command/g;
+
+  &shell_exec($cmd,"$wait");
+}
+
+########################################################
+## color.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub parse_report_line {
+  my ($l,$str) = @_;
+  &parse_line($l,$str);
+  if ( $current_command eq 'summary' && $parsed_tokens[0] =~ /^(\d+) project/ ) {
+    $num_projects = $1;
+    return;
+  }
+  push @{ $report_tokens[$l] }, (@parsed_tokens);
+  push @{ $report_colors_fg[$l] },  (@parsed_colors_fg);
+  push @{ $report_colors_bg[$l] }, (@parsed_colors_bg);
+  push @{ $report_attrs[$l] }, (@parsed_attrs);
+}
+
+#------------------------------------------------------------------
+
+sub parse_line {
+  my ($l,$str) = @_;
+  my $fg = 999999;
+  my $bg = 999999;
+  my $attr = '';
+  @parsed_tokens = ();
+  @parsed_colors_fg = ();
+  @parsed_colors_bg = ();
+  @parsed_attrs = ();
+  my @toks = split(/\x1B/,$str);
+  my $t = 0;
+  #debug("PARSE IN $str");
+  for my $tok (@toks) {
+    if ( $tok eq '' ) { next; }
+    $attr = '';
+    CASE: {
+      # ANSI 16 color attr pairs...
+      if ( $tok =~ s/\[(\d+);(\d+)m// ) {
+        my ($a,$b) = ($1,$2);
+        if ( $a > 30 ) {
+          $fg = $a - 30;
+          $bg = $b - 40;
+        } else {
+          if ( $a eq '1' ) { $attr .= 'bold '; }
+          if ( $b eq '4' ) { $attr .= 'underline' ; }
+          if ( $a eq '7' ) { $attr .= 'inverse '; }
+          if ( $b < 38 ) {
+            $fg = $b - 30;
+          } else {
+            $bg = $b - 40;
+          }
+        }
+        last CASE;
+      }
+      # ANSI 16 color single colors or single attrs or attrs off...
+      if ( $tok =~ s/\[(\d+)m// ) {
+        my $a = $1;
+        if ( $a eq '0' ) {
+          $fg = $bg = 999999;
+          $attr .= 'none ';
+        } elsif ( $a eq '1' ) {
+          $attr .= 'bold ';
+        } elsif ( $a eq '4' ) {
+          $attr .= 'underline ';
+        } elsif ( $a < 38 ) {
+          $fg = $a - 30;
+          $bg = 999999;
+        } elsif ( $a > 99 ) {
+          $attr .= 'standout '; # "bright" in taskwarrior
+          $bg = $a - 100;
+          $fg = 999999;
+        } else {
+          $bg = $a - 40;
+          $fg = 999999;
+        }
+        last CASE;
+      }
+      # ANSI 16 color bold...
+      if ( $tok =~ s/\[1;(\d+);(\d+)m// ) {
+        my ($a,$b) = ($1,$2);
+        $attr .= 'bold ';
+        $fg = $a - 30;
+        $bg = $b - 40;
+        last CASE;
+      }
+      # ANSI 16 color underline...
+      if ( $tok =~ s/\[4;(\d+);(\d+)m// ) {
+        my ($a,$b) = ($1,$2);
+        $attr .= 'underline ';
+        $fg = $a - 30;
+        $bg = $b - 40;
+        last CASE;
+      }
+      # ANSI 16 color inverse...
+      if ( $tok =~ s/\[7;(\d+);(\d+)m// ) {
+        my ($a,$b) = ($1,$2);
+        $attr .= 'inverse ';
+        $fg = $a - 30;
+        $bg = $b - 40;
+        last CASE;
+      }
+      # 256 color xterm foreground...
+      if ( $tok =~ s/\[38;5;(\d+)m// ) {
+        $fg = $1;
+        last CASE;
+      }
+      # 256 color xterm background...
+      if ( $tok =~ s/\[48;5;(\d+)m// ) {
+        $bg = $1;
+        last CASE;
+      }
+    }
+    # FIXME summary mode...
+    # if ( $tok =~ /0%\s+100%/ ) { debug("summary graph tok=\"$tok\" column=$t"); }
+    if ( $tok ne '' ) {
+      $parsed_tokens[$t] = $tok;
+      $parsed_colors_fg[$t] = $fg;
+      $parsed_colors_bg[$t] = $bg;
+      if ( $attr eq '' ) { $attr = 'none'; }
+      $parsed_attrs[$t] = $attr;
+      #if ( $t == 0 ) { debug("PARSE OUT tok=\"$tok\" pos=$l.$t cp=$fg,$bg attr=$attr"); }
+      $t++;
+    }
+  }
+}
+
+#------------------------------------------------------------------
+
+sub extract_color {
+  my ($s,$t) = @_;
+  $parsed_colors_fg[1] = -1;
+  $parsed_colors_bg[1] = -1;
+  $parsed_attrs[1] = '';
+  &audit("EXEC $task rc._forcecolor=on color $s 2>&1");
+  open(IN2,"$task rc._forcecolor=on color $s 2>&1 |");
+  while(<IN2>){
+    if ( $_ =~ /Your sample:/ ) {
+      $_ = <IN2>; $_ = <IN2>;
+      &parse_line(0,$_);
+      if ( $parsed_colors_fg[1] eq '999999' ) { $parsed_colors_fg[1] = -1; }
+      if ( $parsed_colors_bg[1] eq '999999' ) { $parsed_colors_bg[1] = -1; }
+    }
+  }
+  close(IN2);
+}
+
+#------------------------------------------------------------------
+
+
+########################################################
+## curses.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub init_curses {
+  my $m = $_[0];
+  initscr();
+  noecho();
+  curs_set(0);
+  start_color();
+  use_default_colors();
+  init_pair($COLOR_ERRORS,COLOR_WHITE,COLOR_RED);
+  if ( $m eq 'init' ) {
+    init_pair($COLOR_SELECTION,COLOR_WHITE,COLOR_BLUE);
+  }
+  init_pair($COLOR_EMPTY_LINE,COLOR_BLUE,-1); # blue foreground
+  my $HEADER_SIZE = 3;
+  $REPORT_LINES = $LINES - $HEADER_SIZE - 1;
+  $REPORT_COLS = $COLS - 2;
+  $header_win = newwin($HEADER_SIZE, $COLS, 0, 0);
+  $report_win = newwin($REPORT_LINES+$HEADER_SIZE, $REPORT_COLS+2, 3, 1);
+  $prompt_win = newwin(1, $COLS, $LINES-1, 0);
+  keypad($report_win, 1);
+  keypad($prompt_win, 1);
+}
+
+#------------------------------------------------------------------
+
+sub get_color_pair {
+  my($fg,$bg) = @_;
+  my $cp = 0;
+  if ( defined $colors2pair[$fg][$bg] ) {
+    $cp = $colors2pair[$fg][$bg];
+  } else {
+    $cp = $next_color_pair;
+    $colors2pair[$fg][$bg] = $next_color_pair;
+    $next_color_pair++;
+    if ( $fg == 999999 ) { $fg = -1; }
+    if ( $bg == 999999 ) { $bg = -1; }
+    init_pair($cp,$fg,$bg);
+  }
+  return $cp;
+}
+
+
+########################################################
+## draw.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub draw_header_line {
+  my ($row,$lhs,$rhs) = @_;
+  my $str = ' ' x $COLS;
+  $header_win->addstr($row, 0, $str);
+  $header_win->addstr($row, 0, $lhs);
+  $header_win->addstr($row, $COLS - length($rhs), $rhs);
+  $header_win->refresh();
+}
+
+#------------------------------------------------------------------
+
+sub draw_prompt_line {
+  my ($lhs) = @_;
+  $prompt_win->addstr(0, 0, $lhs);
+  $prompt_win->clrtoeol();
+  $prompt_win->addstr(0, $COLS - length($cursor_position) - 1, $cursor_position);
+  $prompt_win->refresh();
+}
+
+#------------------------------------------------------------------
+
+sub draw_prompt {
+  my ($lhs) = @_;
+  $prompt_win->addstr(0, 0, $lhs);
+  $prompt_win->clrtoeol();
+  $cur_pos = length($lhs);
+  $prompt_win->refresh();
+}
+
+#------------------------------------------------------------------
+
+sub draw_prompt_cur {
+  my ($lhs) = @_;
+  $prompt_win->addstr(0, 0, $lhs);
+  $prompt_win->clrtoeol();
+  # the next line calculates the terminal column from the
+  # current position in the prompt string; this calculation
+  # is *not* the identity if there are characters that
+  # occupy more than 1 terminal column (e.g., CJK characters)
+  my $terminal_pos = mbswidth(substr($lhs, 0, $cur_pos));
+  $prompt_win->move(0, $terminal_pos);
+  $prompt_win->refresh();
+}
+
+#------------------------------------------------------------------
+
+sub draw_error_msg {
+  beep();
+  &audit("ERROR $error_msg");
+  $prompt_win->addstr(0, 0, ' ');
+  $prompt_win->clrtoeol();
+  $prompt_win->attron(COLOR_PAIR($COLOR_ERRORS));
+  $prompt_win->attron(A_BOLD);
+  $prompt_win->addstr(0, 0, $error_msg);
+  $prompt_win->attroff(A_BOLD);
+  $prompt_win->attroff(COLOR_PAIR($COLOR_ERRORS));
+  $prompt_win->addstr(0, $COLS - length($cursor_position) - 1, $cursor_position);
+  $prompt_win->refresh();
+}
+
+#------------------------------------------------------------------
+
+sub draw_feedback_msg {
+  my $len = length($feedback_msg);
+  my $start = ($COLS/2) - ($len/2) - 3;
+  $prompt_win->addstr(0, 0, ' ');
+  $prompt_win->clrtoeol();
+  $prompt_win->addstr(0, $start, $feedback_msg);
+  $prompt_win->addstr(0, $COLS - length($cursor_position) - 1, $cursor_position);
+  $prompt_win->refresh();
+}
+
+#------------------------------------------------------------------
+
+sub draw_report_line {
+  my ($i,$line,$mode) = @_;
+  my ($x, $t, $cp, $str);
+  $x = 0;
+  if ( $mode eq 'with-selection' && $i == $task_selected_idx ) {
+    $report_win->attron(COLOR_PAIR($COLOR_SELECTION));
+    &set_attron($report_win,$selection_attrs);
+  }
+  for $t (0 .. $#{ $report_tokens[$i] } ) {
+    if ( $mode eq 'without-selection' || $i != $task_selected_idx ) {
+      my $fg = $report_colors_fg[$i][$t];
+      my $bg = $report_colors_bg[$i][$t];
+      $cp = &get_color_pair($fg,$bg);
+      $report_win->attron(COLOR_PAIR($cp));
+    }
+    #if ( $t == 0 ) { debug("DRAW tok=$line.$t cp=$cp \"$report_tokens[$i][$t]\""); }
+    &set_attron($report_win,$report_attrs[$i][$t]);
+    my $tok = $report_tokens[$i][$t];
+    $report_win->addstr($line,$x,$tok);
+    &set_attroff($report_win,$report_attrs[$i][$t]);
+    if ( $mode eq 'without-selection' || $i != $task_selected_idx ) {
+      $report_win->attroff(COLOR_PAIR($cp));
+    }
+    $x += mbswidth($tok);
+  }
+  my $repeat_count=($REPORT_COLS - $x);
+  if ( $repeat_count < 0 ) {
+    # FIXME
+    # I added this "if" block when VIT exited with a Perl warning that
+    # "VIT fatal error: (converted from warning) Negative repeat count does
+    # nothing..."
+    # Note that warnings are (purposefully) converted to errors because of
+    # using "strict'. There is likely a bug in the algorithm as I'm guessing
+    # the original author of this code never intended for the value to be
+    # negative. I do not think this is a serious bug, and thus I leave this
+    # note as a reminder for if someone takes an in-depth look at the algorithm
+    # or decides for other reasons that a refactoring is needed. I can only
+    # reproduce this issue with a private dataset and unfortunately it is not
+    # the normal case for bugs where one can whittle the dataset down and
+    # easily anonymize it. I will keep the dataset to test in the future in
+    # case a fix is proposed. The tar where will I keep my private
+    # reproduceable dataset is named "vit_negative_repeat.tar.gz".
+    # There are other similar situations in the code. To see the FIXMEs that
+    # are associated with them, do "git grep bd4a905c".
+    # scott k, 2016-05-15
+    $repeat_count = 0;
+  }
+  $str = ' ' x $repeat_count;
+  if ( $mode eq 'without-selection' || $i != $task_selected_idx ) {
+    $report_win->attron(COLOR_PAIR($cp));
+  }
+  &set_attron($report_win,$report_attrs[$i][$#{ $report_tokens[$i] }]);
+  $report_win->addstr($line,$x,$str);
+  &set_attroff($report_win,$report_attrs[$i][$#{ $report_tokens[$i] }]);
+  if ( $mode eq 'with-selection' && $i == $task_selected_idx ) {
+    $report_win->attroff(COLOR_PAIR($COLOR_SELECTION));
+    &set_attroff($report_win,$selection_attrs);
+  } else {
+    $report_win->attroff(COLOR_PAIR($cp));
+  }
+}
+
+#------------------------------------------------------------------
+
+sub flash_current_task {
+  my ($x, $t, $cp, $str);
+  my $i = $task_selected_idx;
+  my $line = $task_selected_idx - $display_start_idx;
+
+  &draw_report_line($i,$line,'without-selection');
+  $report_win->refresh();
+  usleep($flash_delay);
+
+  $report_win->addstr($line,0,' ');
+  $report_win->clrtoeol();
+  $report_win->refresh();
+  usleep($flash_delay);
+
+  &draw_report_line($i,$line,'without-selection');
+  $report_win->refresh();
+  usleep($flash_delay);
+
+  $report_win->addstr($line,0,' ');
+  $report_win->clrtoeol();
+  $report_win->refresh();
+  usleep($flash_delay);
+
+  &draw_report_line($i,$line,'without-selection');
+  $report_win->refresh();
+  usleep($flash_delay);
+}
+
+#------------------------------------------------------------------
+
+sub flash_convergence {
+  $header_win->attron(COLOR_PAIR($COLOR_HEADER));
+  &set_attron($header_win,$header_attrs);
+  &draw_header_line(1,'',"$tasks_completed tasks completed");
+  usleep($flash_delay);
+  &draw_header_line(1,$convergence,"$tasks_completed tasks completed");
+  usleep($flash_delay);
+  &draw_header_line(1,'',"$tasks_completed tasks completed");
+  usleep($flash_delay);
+  &draw_header_line(1,$convergence,"$tasks_completed tasks completed");
+  usleep($flash_delay);
+  &set_attroff($header_win,$header_attrs);
+  $header_win->attroff(COLOR_PAIR($COLOR_HEADER));
+}
+
+#------------------------------------------------------------------
+
+sub set_attron {
+  my ($win,$attr) = @_;
+  if ( ! defined $attr ) { return; }
+  if ( $attr =~ /underline/ ) {
+    $win->attron(A_UNDERLINE);
+  }
+  if ( $attr =~ /bold/ ) {
+    $win->attron(A_BOLD);
+  }
+}
+
+#------------------------------------------------------------------
+
+sub set_attroff {
+  my ($win,$attr) = @_;
+  if ( ! defined $attr ) { return; }
+  if ( $attr =~ /underline/ ) {
+    $win->attroff(A_UNDERLINE);
+  }
+  if ( $attr =~ /bold/ ) {
+    $win->attroff(A_BOLD);
+  }
+  if ( $attr =~ /inverse/ ) {
+    $win->attroff(A_REVERSE);
+  }
+  if ( $attr =~ /standout/ ) {
+    $win->attroff(A_STANDOUT);
+  }
+}
+
+########################################################
+## env.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub init_shell_env {
+  if ( $ENV{'TERM'} =~ /^(xterm|screen)/ ) {
+    my $TERM_newval = "$1-256color";
+    &audit("setting ENV TERM=$TERM_newval");
+    $ENV{'TERM'} = "$TERM_newval";
+  }
+  if ( $titlebar ) {
+    &audit("ENV set titlebar");
+    open(TTY, ">>/dev/tty");
+    print TTY "\e]0;$version\cg\n";
+    close(TTY);
+  }
+}
+
+#------------------------------------------------------------------
+
+sub init_task_env {
+  my @reports;
+  my $id_column = 0;
+  my ($header_color,$task_header_color,$vit_header_color);
+  &audit("EXEC $task show 2>&1");
+  open(IN,"$task show 2>&1 |");
+  while(<IN>) {
+    chop;
+    if ( $_ =~ /color\.header\s+(.*)/ ) {
+      $task_header_color = $1;
+      next;
+    }
+    if ( $_ =~ /color\.vit\.header\s+(.*)/ ) {
+      $vit_header_color = $1;
+      next;
+    }
+    if ( $_ =~ /color\.vit\.selection\s+(.*)/ ) {
+      my $str = $1;
+      $str =~ s/\x1b.*?m//g;
+      $str =~ s/^\s+//;
+      $str =~ s/\s+$//;
+      &extract_color($str,'vit selection');
+      $selection_attrs = $parsed_attrs[1];
+      init_pair($COLOR_SELECTION,$parsed_colors_fg[1],$parsed_colors_bg[1]);
+      next;
+    }
+    if ( $_ =~ /default.command\s+(.*)/ ) {
+      $default_command = $1;
+      $default_command =~ s/\x1b.*?m//g;
+      $default_command =~ s/^\s+//g;
+      $default_command =~ s/\s+$//g;
+      next;
+    }
+    if ( $_ =~ /report\.(.*?)\.columns/ ) {
+      push(@reports, $1);
+      next;
+    }
+    if ( $_ =~ /The color .* is not recognized/ ) {
+      endwin();
+      print "$_\r\n";
+      exit(1);
+    }
+  }
+  close(IN);
+  if ( defined $vit_header_color ) {
+    $header_color = $vit_header_color;
+  } elsif ( defined $task_header_color ) {
+    $header_color = $task_header_color;
+  } else {
+    init_pair($COLOR_HEADER,-1,-1); # not reached
+  }
+  if ( defined $header_color ) {
+    &extract_color($header_color,'header');
+    $header_color =~ s/\x1b.*?m//g;
+    $header_color =~ s/^\s+//;
+    $header_color =~ s/\s+$//;
+    $header_attrs = $parsed_attrs[1];
+    init_pair($COLOR_HEADER,$parsed_colors_fg[1],$parsed_colors_bg[1]);
+  }
+  if ( $cli_args ne '' ) {
+    chop $cli_args;
+    $default_command = $cli_args;
+  }
+  &audit("EXEC $task rc._forcecolor=on rc.verbose=on $default_command 2>&1");
+  open(IN,"$task rc._forcecolor=on rc.verbose=on $default_command 2>&1 |");
+  while(<IN>) {
+    chop;
+    if ( $_ =~ /ID/ || ($default_command eq 'summary' && $_ =~ /Project/) ) {
+      &parse_line(0,$_);
+      @report_header_colors_fg = @parsed_colors_fg;
+      @report_header_colors_bg = @parsed_colors_bg;
+      @report_header_attrs = @parsed_attrs;
+      if ( $parsed_colors_fg[0] eq '999999' ) { $parsed_colors_fg[0] = -1; }
+      if ( $parsed_colors_bg[0] eq '999999' ) { $parsed_colors_bg[0] = -1; }
+      init_pair($COLOR_REPORT_HEADER,$parsed_colors_fg[0],$parsed_colors_bg[0]);
+      $id_column = 1;
+    }
+  }
+  close(IN);
+  if ( ! $id_column && $default_command ne 'summary' ) {
+    endwin();
+    print "Fatal error: default.command (\"$default_command\") must print an \"ID\" column\n";
+    exit(1);
+  }
+  &audit("ENV default command is \"$default_command\"");
+  $current_command = $default_command;
+  push(@reports,$default_command);
+  push(@reports,'summary');
+  @report_types = sort(@reports);
+
+}
+
+########################################################
+## exec.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub task_exec {
+  my ($cmd) = @_;
+  my $es = 0;
+  my $result = '';
+  &audit("TASK EXEC $task $cmd 2>&1");
+  open(IN,"echo -e \"yes\\n\" | $task $cmd 2>&1 |");
+  while(<IN>) {
+    chop;
+    $_ =~ s/\x1b.*?m//g; # decolorize
+    if ( $_ =~ /^\w+ override:/ ) { next; }
+    $result .= "$_ ";
+  }
+  close(IN);
+  if ( $! ) {
+    $es = 1;
+    &audit("FAILED \"$task $cmd\" error closing short pipe");
+  }
+  if ( $? != 0 ) {
+    $es = $?;
+    &audit("FAILED \"$task $cmd\" returned exit status $?");
+  }
+  return ($es,$result);
+}
+
+#------------------------------------------------------------------
+
+sub exited_successfully {
+  my $status = shift || 0;
+  return 1  if  WIFEXITED($status) and WEXITSTATUS($status)==0;
+  return undef;
+}
+
+sub shell_exec {
+  my ($cmd,$mode) = @_;
+  endwin();
+  if ( $clear ne 'NOT_FOUND' ) { system("$clear"); }
+  if ( $audit ) {
+    print "$_[0]\r\n";
+  }
+  if ( ! fork() ) {
+    &audit("EXEC $cmd");
+    exec($cmd);
+    exit();
+  }
+  wait();
+  my $success = &exited_successfully($?);
+  # two reasons to wait:
+  # - an error occurred
+  # - $mode is wait and the user didn't specify nowait in config file
+  if ( not $success or ( $mode eq 'wait' and not $nowait ) or $mode eq 'forcewait' ) {
+    if (not $success) {
+      print "Error while executing command `$cmd'\n";
+    }
+    print "Press return to continue.\r\n";
+    <STDIN>;
+  }
+  &init_curses('refresh');
+  &draw_screen();
+}
+
+
+########################################################
+## getch.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub getch_loop {
+  while (1) {
+    my $ch = $report_win->getch();
+    &audit("Received key: $ch");
+    $refresh_needed = 0;
+    $reread_needed = 0;
+    $error_msg = '';
+    $feedback_msg = '';
+
+    CASE: {
+
+      if (exists $shortcuts{$ch}) {
+        my $action = $shortcuts{$ch};
+        &audit("Processing the following shortcut: $action");
+        &ungetstr($action);
+        last CASE;
+      }
+
+      if ( $ch eq '0' || $ch eq KEY_HOME || ( $ch eq 'g' && $prev_ch eq 'g' ) ) {
+        $task_selected_idx = 0;
+        $display_start_idx = 0;
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch =~ /^\d$/ ) {
+        &cmd_line(":$ch");
+        last CASE;
+      }
+
+      if ( $ch eq 'a' ) {
+        &task_add();
+        last CASE;
+      }
+
+      if ( $ch eq 'A' ) {
+        &task_annotate();
+        last CASE;
+      }
+
+      if ( $ch eq 'D' ) {
+        &task_den_or_del();
+        last CASE;
+      }
+
+      if ( $ch eq 'd' ) {
+        if ( grep(/^Complete\s*$/,@report_header_tokens) ) { # FIXME: really, good enough?
+          $error_msg = "Error: task has already been completed.";
+          $refresh_needed = 1;
+          last CASE;
+        }
+        &task_done();
+        last CASE;
+      }
+
+      if ( $ch eq 'b' ) {
+          &task_start_stop();
+          last CASE;
+      }
+
+      if ( $ch eq "e" ) {
+        &shell_exec("task $report2taskid[$task_selected_idx] edit",'wait');
+        $reread_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'f' ) {
+        &task_filter();
+        last CASE;
+      }
+
+      if ( $ch eq 'G' || $ch eq KEY_END ) {
+        $task_selected_idx = $#report_tokens;
+        if ( $display_start_idx + $REPORT_LINES <= $#report_tokens ) {
+          $display_start_idx = $task_selected_idx - $REPORT_LINES + 1;
+        }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'H' ) {
+        $task_selected_idx = $display_start_idx;
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'j' || $ch eq KEY_DOWN || $ch eq ' ' ) {
+        if ( $task_selected_idx >= $#report_tokens ) {
+          beep;
+          last CASE;
+        }
+        $task_selected_idx++;
+        if ( $task_selected_idx - $REPORT_LINES >= $display_start_idx ) {
+          $display_start_idx++;
+        }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'k' || $ch eq KEY_UP ) {
+        if ( $task_selected_idx == 0 ) {
+          beep;
+          last CASE;
+        }
+        $task_selected_idx--;
+        if ( $task_selected_idx < $display_start_idx ) {
+          $display_start_idx--;
+        }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'L' ) {
+        $task_selected_idx = $display_start_idx + $REPORT_LINES - 1;
+        if ( $task_selected_idx >= $#report_tokens-1 ) { $task_selected_idx = $#report_tokens; }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'M' ) {
+        $task_selected_idx = $display_start_idx + int($REPORT_LINES / 2);
+        if ( $display_start_idx + $REPORT_LINES > $#report_tokens ) {
+          $task_selected_idx = $display_start_idx + int(($#report_tokens - $display_start_idx) / 2);
+        }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'm' ) {
+        &task_modify_prompt();
+        last CASE;
+      }
+
+      if ( $ch eq 'n' || $ch eq 'N' ) {
+        if ( defined $search_pat ) {
+          &do_search($ch);
+          $refresh_needed = 1;
+          last CASE;
+        }
+        else {
+          # do nothing: the user has mistakenly requested a search next/previous
+          # before doing an initial search.
+          # Alternative: give a search prompt (this is what mutt does).
+          last CASE;
+        }
+      }
+
+      if ( $ch eq 'P' ) {
+        &task_set_priority();
+        last CASE;
+      }
+
+      if ( $ch eq 'p' ) {
+        &task_set_project();
+        last CASE;
+      }
+
+      if ( $ch eq 'q' ) {
+        &prompt_quit();
+        last CASE;
+      }
+
+      if ( $ch eq 'Q' || ($ch eq 'Z' && $prev_ch eq 'Z') ) {
+        return;
+      }
+
+      if ( $ch eq 's' ) {
+        my $majmin = &task_version('major.minor');
+        if ( $majmin >= 2.3 ) {
+          &shell_exec("task sync",'wait');
+          $reread_needed = 1;
+        }
+        else {
+          $error_msg = "'sync' was introduced in Taskwarrior 2.3.0";
+          $refresh_needed = 1;
+        }
+        last CASE;
+      }
+
+      if ( $ch eq 't' ) {
+        &ungetstr(':!rw task ')
+      }
+
+      if ( $ch eq 'T' ) {
+        &task_set_tag();
+        last CASE;
+      }
+
+      if ( $ch eq 'u' ) {
+        &shell_exec('task undo','wait');
+        $reread_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq 'w' ) {
+        &task_set_wait();
+        last CASE;
+      }
+
+      if ( $ch eq '/' ) {
+        $search_direction = 1;
+        &start_search();
+        last CASE;
+      }
+
+      if ( $ch eq '?' ) {
+        $search_direction = 0;
+        &start_search();
+        last CASE;
+      }
+
+      if ( $ch eq ':' ) {
+        &cmd_line(':');
+        last CASE;
+      }
+
+      if ( $ch eq '=' || $ch eq "\n" ) {
+        if ( $current_command eq 'summary' ) {
+          my $p = $report_tokens[$task_selected_idx][0];
+          $p =~ s/(.*?)\s+.*/$1/;
+          $p =~ s/\(none\)//;
+          $current_command = "ls project:$p";
+          $reread_needed = 1;
+        } else {
+          &shell_exec("task $report2taskid[$task_selected_idx] information",'forcewait');
+        }
+        last CASE;
+      }
+
+      if ( $ch eq "\cb" || $ch eq KEY_PPAGE ) {
+        $display_start_idx -= $REPORT_LINES;
+        $task_selected_idx -= $REPORT_LINES;
+        if ( $display_start_idx < 0 ) { $display_start_idx = 0; }
+        if ( $task_selected_idx < 0 ) { $task_selected_idx = 0; }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq "\cf" || $ch eq KEY_NPAGE ) {
+        $display_start_idx += $REPORT_LINES;
+        $task_selected_idx += $REPORT_LINES;
+        if ( $task_selected_idx > $#report_tokens ) {
+          $display_start_idx = $#report_tokens;
+          $task_selected_idx = $#report_tokens;
+        }
+        $refresh_needed = 1;
+        last CASE;
+      }
+
+      if ( $ch eq "\cl" ) {
+        endwin();
+        &init_curses('refresh');
+        &read_report('refresh');
+        if ( $task_selected_idx > $display_start_idx + $REPORT_LINES - 1 ) {
+          $display_start_idx = $task_selected_idx - $REPORT_LINES + 1;
+        }
+        &draw_screen();
+        last CASE;
+      }
+
+      if ( $ch eq "\e" || $ch eq "\cg" ) {
+        $error_msg = '';
+        $feedback_msg = '';
+        $refresh_needed = 1;
+        $input_mode = 'cmd';
+        last CASE;
+      }
+      if ( $ch eq 'Z' ) { last CASE; }
+      if ( $ch eq KEY_RESIZE ) {
+        # FIXME resize
+        # this code chunk is also in prompt.pl
+        if ( $LINES > 1 ) {
+          &audit("Received KEY_RESIZE. Going to refresh.");
+          &init_curses('refresh');
+          &draw_screen();
+        } else {
+          &audit("Received KEY_RESIZE, but terminal height ($LINES) too
+            small to refresh.");
+        }
+        last CASE;
+      }
+      if ( $ch eq '-1' ) { last CASE; }
+      # before beeping, rule out the first 'g' in a 'gg' sequence
+      # (which is not handled above)
+      if ( $ch ne 'g' ) {
+        beep();
+      }
+    }
+    if ( $ch ne '/' && $ch ne '?' && $ch ne 'n' && $ch ne 'N' ) {
+      $input_mode = 'cmd';
+    }
+    $prev_ch = $ch;
+    if ( $reread_needed ) { &read_report('refresh'); }
+    if ( $refresh_needed || $reread_needed ) { &draw_screen(); }
+
+  }
+}
+
+########################################################
+## misc.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub audit {
+  if ( $audit ) {
+    print AUDIT "$$ ";
+    print AUDIT @_;
+    print AUDIT "\r\n";
+  }
+}
+
+#------------------------------------------------------------------
+
+sub clean_exit {
+  unless( $audit ) {
+    &shell_exec("clear", 'no-wait');
+  }
+  if ( $audit ) {
+      close(AUDIT) or die "$!";
+  }
+
+  endwin() unless isendwin();
+  exit();
+}
+
+#------------------------------------------------------------------
+
+sub error_exit {
+  # do not exit VIT if we are in a try/catch block
+  if ( $during_try ) {
+    return
+  }
+  unless( $audit ) {
+    &shell_exec("clear", 'no-wait');
+  }
+
+  endwin();
+  print STDERR "VIT fatal error: @_\r\n";
+
+  if ( $audit ) {
+      close(AUDIT) or die "$!";
+  }
+
+  exit(1);
+}
+
+#------------------------------------------------------------------
+
+sub debug {
+  print AUDIT @_;
+  print AUDIT "\r\n";
+}
+
+#------------------------------------------------------------------
+
+sub is_printable {
+  my $char = $_[0];
+  if ( $char =~ /^[0-9]+$/ && $char >= KEY_MIN ) {
+    return 0;
+  }
+  if ( $char =~ /[[:cntrl:]]/ ) {
+    return 0;
+  }
+  return 1;
+}
+
+#------------------------------------------------------------------
+
+sub task_version {
+  my $request = $_[0];
+  my $version;
+  open(IN,"task --version 2>&1 |");
+  while(<IN>) {
+    chop;
+    $version = $_;
+  }
+  close(IN);
+  if ( $request eq "major.minor" ) {
+    my @v_ = split(/\./,$version);
+    return "$v_[0].$v_[1]";
+  }
+  return $version;
+}
+
+#------------------------------------------------------------------
+
+sub task_info {
+  my $n = $_[0];
+  my $id = $report2taskid[$task_selected_idx];
+  &audit("EXEC $task $id information 2>&1");
+  open(IN,"task $id information 2>&1 |");
+  while(<IN>) {
+    chop;
+    $_ =~ s/\x1b.*?m//g; # decolorize
+    if ( $_ =~ /^$n\s+(.*)/ ) {
+      my $v = $1;
+      $v =~ s/\s+$//;
+      close(IN);
+      return $v;
+    }
+  }
+  close(IN);
+  return '';
+}
+
+#------------------------------------------------------------------
+
+sub ungetstr {
+  my $str = $_[0];
+  my $err;
+  foreach my $ch (reverse split('', $str)) {
+    $err = ungetch($ch);
+    if ( $err != 0 ) {
+      error_exit("Shortcut is too long.");
+    }
+  }
+  return '';
+}
+
+########################################################
+## prompt.pl...
+
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub prompt_y {
+  my $ch = &prompt_chr(@_);
+  my $ans = 0;
+  if ( $ch eq "y" || $ch eq "Y" ) { $ans = 1; }
+  return $ans;
+}
+
+#------------------------------------------------------------------
+# The following function is, with minor modifications, from
+#   https://cpan.rt.develooper.com/Public/Bug/Display.html?id=27335
+# TODO:
+#   Is there a normal Perl way of doing the following more simple?
+#   - [BaZo] I think modern Curses can handle multibyte input
+#            with the getchar() function
+#            See http://search.cpan.org/~giraffed/Curses-1.36/Curses.pm#getchar
+sub prompt_u8getch() {
+  my $chr = $prompt_win->getch();
+
+
+  my $cpt = ord($chr);
+  if ($chr =~ /\A\d+\z/ || $cpt <= 127) {
+    if ($cpt eq 23) {
+      return 23;
+    }else{
+      return $chr;
+    }
+    
+  }
+  my $len=1;
+     if (($cpt & 0xe0) == 0xc0) { $len = 2; }
+  elsif (($cpt & 0xf0) == 0xe0) { $len = 3; }
+  elsif (($cpt & 0xf8) == 0xf0) { $len = 4; }
+  elsif (($cpt & 0xfc) == 0xf8) { $len = 5; }
+  elsif (($cpt & 0xfe) == 0xfc) { $len = 6; }
+  else {
+    return $chr;
+  }
+  for my $i (2..$len) {
+    my $chri = $prompt_win->getch();
+    return $chri if ((ord($chri) & 0xc0) != 0x80);
+    $chr .= $chri;
+  }
+  return decode_utf8($chr);
+}
+
+#------------------------------------------------------------------
+
+sub prompt_chr {
+  my ($prompt) = @_;
+  my $ch;
+  echo();
+  curs_set(1);
+  &draw_prompt($prompt);
+  $ch = $prompt_win->getch();
+  if ( $ch eq KEY_RESIZE ) {
+    # FIXME resize
+    # This code chunk is also in getch.pl, except the call to draw_prompt_cur.
+    if ( $LINES > 1 ) {
+      &audit("Received KEY_RESIZE. Going to refresh.");
+      &init_curses('refresh');
+      &draw_screen();
+    } else {
+      &audit("Received KEY_RESIZE, but terminal height ($LINES) too small to
+        refresh.");
+    }
+    $ch = &prompt_chr($prompt);
+  }
+  noecho();
+  curs_set(0);
+  return $ch;
+}
+
+#------------------------------------------------------------------
+
+sub prompt_str {
+  my ($prompt) = @_;
+  $cur_pos = length($prompt);
+  my $str = ''; # current user input
+  my $history_idx = 0;
+  my $addedPromptStr = 0;
+
+  my $mode; # type of completion to use (tags, command, projects)
+  my @match_types; # array containing strings to match against
+  my $tab_cnt = 0; # number of subsequent tab presses (for iterating through completions);
+                   # shift-tabs can make this negative
+  my $tab_started = undef; # whether the user has pressed tab before
+  my $tab_match_str = ''; # value of $str upon first press of tab
+
+
+  # split prompt into prompt text and user input
+  if ( $prompt =~ /^(:)(.*)/ || $prompt =~ /^(.*?: )(.*)/ || $prompt =~ /^(.*?:)(.*)/ ) {
+    $prompt = $1;
+    $str = $2;
+  }
+  my $prompt_len = length($prompt);
+
+  # determine mode from prompt text
+  if ( $prompt eq ':' ) {
+    $mode = 'cmd';
+    @match_types = @report_types;
+  } else {
+    $mode = lc($prompt);
+    $mode =~ s/:.*$//;
+    if ( $mode eq 'project' ) {
+      @match_types = @project_types;
+    } elsif ( $mode eq 'tag' ) {
+      @match_types = @tag_types;
+    }
+  }
+
+  curs_set(1);
+  &draw_prompt("$prompt$str");
+
+  while (1) {
+    my $ch = prompt_u8getch();
+    if ( $tab_started and $ch ne "\t"     and $ch ne KEY_BTAB
+                      and $ch ne KEY_STAB and $ch ne KEY_RESIZE ) {
+      # When a key other than tab is pressed, then stop the tabbing cycle.
+      # That is, only uninterrupted tab keys cycle through completions.
+      # The only exceptions, which allow the continuation of tab cycling, are
+      # resize events, backtabs, shift-tabs and (obviously) regular tabs
+      $tab_started = undef;
+      #NOTE: no "next" here on purpose
+    }
+
+    if ( $ch eq "\cu" ) {
+      $str = substr($str, $cur_pos - $prompt_len);
+      $cur_pos = $prompt_len;
+      &draw_prompt_cur("$prompt$str");
+      next;
+    }
+    if ( $ch eq "\e" || $ch eq "\cg" ) {
+      noecho();
+      curs_set(0);
+      return '';
+    }
+    if ( $ch eq "\n" ) {
+      last;
+    }
+    
+    if ( $ch eq "\t" or $ch eq KEY_STAB or $ch eq KEY_BTAB ) {
+      # handle tab completion
+      if ( $mode ne 'cmd' and $mode ne 'project' and $mode ne 'tag' ) {
+        # tab completion only makes sense for enumerable fields
+        beep();
+        next;
+      }
+      if ( not $tab_started ) {
+        # this is the first time the user presses tab (possibly after editing
+        # so reset the tab completion
+        $tab_match_str = $str;
+        $tab_started = 1;
+        $tab_cnt = 0;
+      }
+      # move forward or backwards in the list based on the key press (tab or backtab)
+      if ( $ch eq "\t") {
+        $tab_cnt++;
+      } else {
+        $tab_cnt--;
+      }
+
+      # check string to match
+      if ( $tab_match_str eq '' ) {
+        # empty string, so cycle through all possible options
+        my $idx = ($tab_cnt-1) % @match_types;
+        $str = $match_types[$idx];
+      } else {
+        # match based on the user input
+
+        # first we need to strip off a possible + or - prefix, which are used for tags
+        my $fc = ''; # (optional) prefix is saved here
+        if ($mode eq 'tag') {
+          $fc = substr($tab_match_str,0,1);
+          if ($fc eq '-' or $fc eq '+') {
+            $tab_match_str = substr($tab_match_str,1);
+          } else {
+            $fc = '';
+          }
+        }
+
+        # do the actual match.  note the \Q\E to stop possible expansion of user input
+        my @matches = (grep(/^\Q$tab_match_str\E/,@match_types));
+        if ( $#matches == -1 ) {
+          # no match, so reset
+          $tab_started = undef;
+          beep();
+        } else  {
+          my $idx = ($tab_cnt-1) % @matches;
+
+          # put back a potential + or - prefix
+          $str = $fc . $matches[$idx];
+          $tab_match_str = $fc . $tab_match_str;
+        }
+      }
+      &draw_prompt("$prompt$str");
+      next;
+    }
+# This code was causing problems and was undocumented.
+#    if ( $ch eq "\cw" ) {
+#      if ( $str eq '' ) {
+#        chop $str;
+#        beep();
+#        next;
+#      }
+#      if ( $str =~ s/^(.*\s+)\S+\s+$/$1/ ) {
+#        &draw_prompt("$prompt$str");
+#        next;
+#      }
+#      if ( $str =~ s/^.*\s+$// ) {
+#        &draw_prompt("$prompt$str");
+#        next;
+#      }
+#      if ( $str =~ s/^(.*\s+).*/$1/ ) {
+#        &draw_prompt("$prompt$str");
+#        next;
+#      }
+#      $str = "";
+#      &draw_prompt("$prompt$str");
+#      next;
+#    }
+    if ( $ch eq KEY_BACKSPACE || $ch eq "\b" || $ch eq "\c?" ) {
+      if ( $cur_pos > $prompt_len ) {
+        $cur_pos--;
+        substr($str, $cur_pos - $prompt_len, 1, "");
+        &draw_prompt_cur("$prompt$str");
+        next;
+      }
+    }
+
+    if ($ch eq 23) {
+      # CTRL-W, delete word
+
+      if (length($str) > 0 and substr($str, length($str)-1) eq " ") {
+        $str = substr($str, 0, length($str)-2);
+      }
+      my $end = rindex($str," ");
+      if ($end eq -1) {
+        $str = "";
+        $cur_pos = $prompt_len;
+      }else{
+        
+        $str = substr($str, 0, $end);
+        $str = "$str ";
+        $cur_pos = $end + $prompt_len + 1;
+      }
+      &draw_prompt_cur("$prompt$str");
+      next;
+    }
+
+    if ( $ch eq KEY_LEFT ) {
+      if ( $cur_pos > $prompt_len ) {
+        $cur_pos -= 1;
+      }
+      &draw_prompt_cur("$prompt$str");
+      next;
+    }
+    if ( $ch eq KEY_RIGHT ) {
+      if ( $cur_pos < length("$prompt$str") ) {
+        $cur_pos += 1;
+      }
+      &draw_prompt_cur("$prompt$str");
+      next;
+    }
+    if ( $ch eq KEY_UP ) {
+      # We treat $history_idx specially because we save the prompt string the
+      # first time
+      # $#{ $histories{$prompt} } returns -1 if $prompt is not an existing key
+      if ( $history_idx > 0 && $history_idx >= $#{ $histories{$prompt} } ) {
+        next;
+      }
+      if ( $history_idx == 0 && $history_idx >= $#{ $histories{$prompt} } + 1 ) {
+        next;
+      }
+      if ( $history_idx == 0 ) {
+          if ( $addedPromptStr == 0 ) {
+            # don't add sequential duplicates
+            if ( $str ne $histories{$prompt}[0] ) {
+              $addedPromptStr = 1;
+              unshift @{ $histories{$prompt} }, $str;
+            }
+          }
+          else {
+            # if the user edits working prompt again, no need to add as separate
+            $histories{$prompt}[0] = $str;
+          }
+      }
+      $history_idx++;
+      $str = $histories{$prompt}[$history_idx];
+      &draw_prompt("$prompt$str");
+    }
+    if ( $ch eq KEY_DOWN ) {
+      if ( $history_idx == 0 ) {
+        next;
+      }
+      $history_idx--;
+      $str = $histories{$prompt}[$history_idx];
+      &draw_prompt("$prompt$str");
+    }
+    if ( $ch eq KEY_HOME ) {
+      $cur_pos = $prompt_len;
+      &draw_prompt_cur("$prompt$str");
+    }
+    if ( $ch eq KEY_END ) {
+      $cur_pos = length("$prompt$str");
+      &draw_prompt_cur("$prompt$str");
+    }
+    # Put hardcoded keys down here since they are the most fragile
+    # and could be platform-dependent. If they are defined differently,
+    # hopefully they will be matched above first.
+    if ( $ch eq 330 ) { # KEY_DELETE is not defined
+      if ( $cur_pos >= $prompt_len ) {
+        substr($str, $cur_pos - $prompt_len, 1, "");
+        &draw_prompt_cur("$prompt$str");
+        next;
+      }
+    }
+    if ( $ch eq KEY_RESIZE ) {
+      # FIXME resize
+      # This code chunk is also in getch.pl, except the call to draw_prompt_cur.
+      &audit("Received KEY_RESIZE. Going to refresh.");
+      &init_curses('refresh');
+      &draw_screen();
+      &draw_prompt_cur("$prompt$str");
+      curs_set(1);
+      next;
+    }
+    if ( ! &is_printable($ch) ) {
+      next;
+    }
+    if ( &is_printable($ch) ) {
+      substr($str, $cur_pos - $prompt_len, 0, $ch);
+      $cur_pos++;
+    }
+    &draw_prompt_cur("$prompt$str");
+  }
+  noecho();
+  curs_set(0);
+  if ( $mode ne 'project' && $str eq '' ) { beep(); }
+  if ( ! $str =~ /^:!/ ) {
+    $str =~ s/"/\\"/g;
+    $str =~ s/^\s+//;
+    $str =~ s/\s+$//;
+  }
+  if ( $addedPromptStr == 0 ) {
+    # we add if no elements or not a sequential duplicate
+    if ( $#{ $histories{$prompt} } < 0 || $str ne $histories{$prompt}[0] ) {
+      # do not add an empty string
+      if ( $str ne "" ) {
+        unshift @{ $histories{$prompt} }, $str;
+      }
+    }
+  }
+  else {
+    $histories{$prompt}[0] = $str;
+  }
+  return $str;
+}
+
+########################################################
+## read.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub read_report {
+  my ($mode) = @_;
+  &inner_read_report($mode);
+  if ( $prev_ch eq 'd' && $error_msg =~ /Error: task .*: no matches/ ) {
+    # take care of marking last done...
+    &inner_read_report('init');
+  }
+  if ( $current_command eq 'summary' ) {
+    &get_num_tasks();
+  }
+}
+
+#------------------------------------------------------------------
+
+sub inner_read_report {
+  my ($mode) = @_;
+
+  my $report_header_idx = 0;
+  my $args;
+  my @prev_num_tasks = $num_tasks;
+  my @prev_report2taskid = @report2taskid;
+  my @prev_report_tokens = @report_tokens;
+  my @prev_report_lines = @report_lines;
+  my @prev_report_colors_fg = @report_colors_fg;
+  my @prev_report_colors_bg = @report_colors_bg;
+  my @prev_report_attrs = @report_attrs;
+  my @prev_report_header_tokens = @report_header_tokens;
+  my @prev_report_header_attrs = @report_header_attrs;
+  $prev_convergence = $convergence;
+
+  $prev_display_start_idx = $display_start_idx;
+  $prev_task_selected_idx = $task_selected_idx;
+  @report2taskid = ();
+  @report_tokens = ();
+  @report_lines = ();
+  @report_colors_fg = ();
+  @report_colors_bg = ();
+  @report_attrs = ();
+  @report_header_tokens = ();
+  @report_header_attrs = ();
+  @project_types = ();
+  if ( $mode eq 'init' ) {
+    $task_selected_idx = 0;
+    $display_start_idx = 0;
+  }
+
+  &audit("EXEC $task stat 2>&1");
+  open(IN,"$task stat 2>&1 |");
+  while(<IN>) {
+    chop;
+    if ( $_ =~ /^\s*$/ ) { next; }
+    $_ =~ s/\x1b.*?m//g;
+    if ( $_ =~ /Pending\s+(\d+)/ ) {
+      $tasks_pending = $1;
+      next;
+    }
+    if ( $_ =~ /Completed\s+(\d+)/ ) {
+      $tasks_completed = $1;
+      next;
+    }
+  }
+  close(IN);
+
+  if ( $burndown eq "yes" ) {
+    $args = "rc.defaultwidth=$REPORT_COLS rc.defaultheight=$REPORT_LINES burndown";
+    &audit("EXEC $task $args 2>&1");
+    open(IN,"$task $args 2>&1 |");
+    while(<IN>) {
+      if ( $_ =~ /Estimated completion: No convergence/ ) {
+        $convergence = "no convergence";
+        last;
+      }
+      if ( $_ =~ /Estimated completion: .* \((.*)\)/ ) {
+        $convergence = "convergence in $1";
+        last;
+      }
+    }
+    close(IN);
+    if ( $convergence ne $prev_convergence && $prev_convergence ne '' ) {
+      $flash_convergence = 1;
+    } else {
+      $flash_convergence = 0;
+    }
+  }
+
+  &audit("EXEC $task projects 2>&1");
+  open(IN,"$task projects 2>&1 |");
+  while(<IN>) {
+    chop;
+    if ( $_ =~ /^\s*$/ ) { next; }
+    $_ =~ s/\x1b.*?m//g;
+    if ( $_ =~ /^\w+ override/ ) { next; }
+    if ( $_ =~ /^Project/ ) { next; }
+    if ( $_ =~ /^\d+ project/ ) { next; }
+    my $p = (split(/\s+/,$_))[0];
+    if ( $p eq '(none)' ) { next; }
+    push(@project_types, $p);
+  }
+  close(IN);
+
+  {
+    &audit("EXEC $task tags 2>&1");
+    @tag_types=();
+    open(IN,"$task tags 2>&1 |");
+    my $_started = undef;
+    while (my $line=<IN>) {
+      # list of tasks starts after a line containing "--- -----"
+      if ($line =~ /^-+ -+$/) {
+        $_started = 1;
+        next;
+      }
+      next unless $_started;
+
+      # save tag in first field of line
+      chomp $line;
+      last if $line eq '';
+      my $t = ( split(/\s+/,$line) )[0];
+      push(@tag_types, $t);
+    }
+    close(IN);
+  }
+
+  $args = "rc.defaultwidth=$REPORT_COLS rc.defaultheight=0 rc._forcecolor=on $current_command";
+  &audit("EXEC $task $args 2> /dev/null");
+  open(IN,"$task $args 2> /dev/null |");
+  my $i = 0;
+  my $prev_id;
+  while(<IN>) {
+    chop;
+    $_ = &decode_utf8($_);
+    if ( $_ =~ /^\s*$/ ) { next; }
+    if ( $_ =~ /^(\d+) tasks?$/ ||
+         $_ =~ /^\x1b.*?m(\d+) tasks?\x1b\[0m$/ ||
+         $_ =~ /^\d+ tasks?, (\d+) shown$/ ||
+         $_ =~ /^\x1b.*?m\d+ tasks?, (\d+) shown\x1b\[0m$/ ) {
+      $num_tasks = $1;
+      next;
+    }
+    &parse_report_line($i,$_);
+    $_ =~ s/\x1b.*?m//g;
+    $report_lines[$i] =  $_;
+
+    # check if this is the header line
+    if ( $_ =~ /^ID / ) {
+      $report_header_idx = $i;
+      $i++;
+      next;
+    }
+
+    if ( $_ =~ /^\s{0,5}(\d+) / ) {
+      $report2taskid[$i] = $1;
+      $taskid2report[$1] = $i;
+      &audit("inner_read_report: report2taskid[$i]=$1, taskid2report[$1]=$i")
+    } else {
+      $report2taskid[$i] = $prev_id;
+      audit("inner_read_report: report2taskid[$i]=$prev_id")
+    }
+    $prev_id = $report2taskid[$i];
+    $i++;
+  }
+  close(IN);
+
+  if ( $#report_tokens > -1 ) {
+    # TODO: this code is quite hard to understand; should probably be rewritten
+    #       or at least needs explanation of what is happening here. [BaZo]
+    @report_header_tokens = @{ $report_tokens[$report_header_idx] };
+    @report_header_attrs = @{ $report_attrs[$report_header_idx] };
+    splice(@report_tokens,$report_header_idx,1);
+    splice(@report_lines,$report_header_idx,1);
+    splice(@report_colors_fg,$report_header_idx,1);
+    splice(@report_colors_bg,$report_header_idx,1);
+    splice(@report_attrs,$report_header_idx,1);
+    splice(@report2taskid,$report_header_idx,1);
+    for (0..$#taskid2report) {
+      $taskid2report[$_]-- if ($_>=$report_header_idx)
+    }
+    if ( $task_selected_idx > $#report_tokens ) {
+      $task_selected_idx = $#report_tokens;
+    }
+  } else {
+    $error_msg = "Error: task $current_command: no matches";
+    $current_command = $prev_command;
+    $display_start_idx = $prev_display_start_idx;
+    $task_selected_idx = $prev_task_selected_idx;
+    @report_header_tokens = @prev_report_header_tokens;
+    @report_header_attrs = @prev_report_header_attrs;
+    @report_tokens = @prev_report_tokens;
+    @report_lines = @prev_report_lines;
+    @report_colors_fg = @prev_report_colors_fg;
+    @report_colors_bg = @prev_report_colors_bg;
+    @report_attrs = @prev_report_attrs;
+    @report2taskid = @prev_report2taskid;
+    $convergence = $prev_convergence;
+    return;
+  }
+
+}
+
+#------------------------------------------------------------------
+
+sub get_num_tasks {
+  $num_tasks = 0;
+  &audit("EXEC $task projects 2> /dev/null");
+  open(IN,"$task projects 2> /dev/null |");
+  while(<IN>) {
+    if ( $_ =~ /(\d+) task/ ) {
+      $num_tasks = $1;
+      last;
+    }
+  }
+  close(IN);
+}
+
+#------------------------------------------------------------------
+
+
+########################################################
+## search.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub start_search {
+  my $ch = $_[0];
+  if ( $search_direction == 1 ) {
+    $search_pat = '/';
+  } else {
+    $search_pat = '?';
+  }
+  &draw_prompt($search_pat);
+  echo();
+  curs_set(1);
+  $cur_pos = 1;
+  GETCH: while (1) {
+    my $ch = prompt_u8getch();
+    if ( $ch eq "\ch" || $ch eq KEY_BACKSPACE ) {
+      if ( $cur_pos > 1 ) {
+        $cur_pos--;
+        substr($search_pat, $cur_pos, 1, "");
+      }
+      &draw_prompt_cur($search_pat);
+      next GETCH;
+    }
+    if ( $ch eq "\cu" ) {
+      my $search_ch;
+      if ( $search_direction == 1 ) {
+        $search_ch = '/';
+      } else {
+        $search_ch = '?';
+      }
+      $search_pat = $search_ch.substr($search_pat, $cur_pos);
+      $cur_pos = 1;
+      &draw_prompt_cur($search_pat);
+      next GETCH;
+    }
+    if ( $ch eq "\e" || $ch eq "\cg" ) {
+      &draw_prompt('');
+      noecho();
+      curs_set(0);
+      return;
+    }
+    if ( $ch eq "\n" ) {
+      last GETCH;
+    }
+    if ( $ch eq KEY_LEFT ) {
+      if ( $cur_pos > 1 ) {
+        $cur_pos--;
+      }
+      &draw_prompt_cur($search_pat);
+      next GETCH;
+    }
+    if ( $ch eq KEY_RIGHT ) {
+      if ( $cur_pos < length($search_pat) ) {
+        $cur_pos++;
+      }
+      &draw_prompt_cur($search_pat);
+      next GETCH;
+    }
+
+    if ( &is_printable($ch) ) {
+      substr($search_pat, $cur_pos, 0, $ch);
+      $cur_pos = $cur_pos + 1;
+    }
+    &draw_prompt_cur($search_pat);
+  }
+  noecho();
+  curs_set(0);
+  $search_pat = substr($search_pat, 1);
+  if ( $search_pat eq '' ) {
+    $search_pat = '';
+    &draw_prompt('');
+    beep();
+    return;
+  }
+  $refresh_needed = 1;
+  if ( ! &do_search('n') ) {
+    return;
+  }
+  $input_mode = 'search';
+  return;
+}
+
+#------------------------------------------------------------------
+
+sub do_search {
+  my $ch = $_[0];
+  my $rtn = &do_inner_search($ch);
+  if ( $rtn == 1 ) {
+    if ( $task_selected_idx - $display_start_idx >= $REPORT_LINES ) {
+      $display_start_idx = $task_selected_idx - $REPORT_LINES + 1;
+    } elsif ( $task_selected_idx < $display_start_idx ) {
+      $display_start_idx = $task_selected_idx;
+    }
+    return 1;
+  } else {
+    $error_msg = "Pattern not found: $search_pat";
+    beep();
+    return 0;
+  }
+  return 0;
+}
+
+#------------------------------------------------------------------
+
+sub do_inner_search {
+  my $ch = $_[0];
+  $during_try = 1;
+  my $search_pat_run;
+  try {
+    "dummytext" =~ /$search_pat/i;
+    $search_pat_run = $search_pat;
+  } catch {
+    # print search_pat but run search_pat_run so the user sees original input. e.g.
+    # search_pat = "abc\"
+    # search_pat_actual = "abc\\"
+    $search_pat_run = quotemeta($search_pat);
+  };
+  $during_try = 0;
+  if ( $search_direction == 1 && $ch eq 'n' || $search_direction == 0 && $ch eq 'N' ) {
+    for ( my $i = $task_selected_idx + 1; $i <= $#report_lines; $i++ ) {
+      if ( $report_lines[$i] =~ /$search_pat_run/i ) {
+         $task_selected_idx = $i;
+         return 1;
+      }
+    }
+    &draw_prompt('Search hit BOTTOM, continuing at TOP');
+    usleep($error_delay);
+    for ( my $i = 0; $i < $task_selected_idx; $i++ ) {
+      if ( $report_lines[$i] =~ /$search_pat_run/i ) {
+        $task_selected_idx = $i;
+        return 1;
+      }
+    }
+    if ( $report_lines[$task_selected_idx] =~ /$search_pat_run/i ) { return 1; }
+    return 0;
+  }
+  if ( $search_direction == 1 && $ch eq 'N' || $search_direction == 0 && $ch eq 'n' ) {
+    for ( my $i = $task_selected_idx - 1; $i >= 0; $i-- ) {
+      if ( $report_lines[$i] =~ /$search_pat_run/i ) {
+         $task_selected_idx = $i;
+        return 1;
+      }
+    }
+    &draw_prompt('Search hit TOP, continuing at BOTTOM');
+    usleep($error_delay);
+    for ( my $i = $#report_lines; $i > $task_selected_idx; $i-- ) {
+      if ( $report_lines[$i] =~ /$search_pat_run/i ) {
+        $task_selected_idx = $i;
+        return 1;
+      }
+    }
+    if ( $report_lines[$task_selected_idx] =~ /$search_pat_run/i ) { return 1; }
+    return 0;
+  }
+  return -1;
+}
+
+########################################################
+## screen.pl...
+# Copyright 2012 - 2013, Steve Rader
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub draw_screen {
+  my ($x,$t,$fg,$bg,$cp,$str);
+  my $line = 0;
+
+  $header_win->attron(COLOR_PAIR($COLOR_HEADER));
+  &set_attron($header_win,$header_attrs);
+  CASE: {
+    if ( $current_command eq 'summary' && $num_projects == 1 ) {
+      $str = '1 project';
+      last CASE;
+    }
+    if ( $current_command eq 'summary' ) {
+      $str = "$num_projects projects";
+      last CASE;
+    }
+    if ( $num_tasks == 1 ) {
+      $str = '1 task shown';
+      last CASE;
+    }
+    $str = "$num_tasks tasks shown";
+  }
+  &draw_header_line(0,"task $current_command",$str);
+  CASE: {
+    if ( $current_command eq 'summary' && $num_tasks == 1 ) {
+      $str = '1 task';
+      last CASE;
+    }
+    if ( $current_command eq 'summary' ) {
+      $str = "$num_tasks tasks";
+      last CASE;
+    }
+    if ( $tasks_completed == 1 ) {
+      $str = '1 task completed';
+      last CASE;
+    }
+    $str = "$tasks_completed tasks completed";
+  }
+  &draw_header_line(1,$convergence,$str);
+  &set_attroff($header_win,$header_attrs);
+  $header_win->attroff(COLOR_PAIR($COLOR_HEADER));
+
+  $header_win->attron(COLOR_PAIR($COLOR_REPORT_HEADER));
+  $x = 1;
+  for $t (0 .. $#report_header_tokens) {
+    &set_attron($header_win,$report_header_attrs[$t]);
+    $header_win->addstr(2,$x,$report_header_tokens[$t]);
+    &set_attroff($header_win,$report_header_attrs[$t]);
+    $x += length($report_header_tokens[$t]);
+  }
+
+  my $repeat_count=($REPORT_COLS - $x + 1);
+  if ( $repeat_count < 0 ) {
+    # FIXME
+    # see commit bd4a905c
+    # I triggered this possibility (that is, that $repeat_count is negative)
+    # by zooming out and then zooming in very close, on gnome-terminal.
+    $repeat_count = 0;
+  }
+  $str = ' ' x $repeat_count;
+
+  &set_attron($header_win,$report_header_attrs[$#report_header_attrs]);
+  $header_win->addstr(2,$x,$str);
+  &set_attroff($header_win,$report_header_attrs[$#report_header_attrs]);
+  $header_win->attroff(COLOR_PAIR($COLOR_REPORT_HEADER));
+  $header_win->refresh();
+
+  #debug("DRAW lines=$REPORT_LINES start=$display_start_idx cur=$task_selected_idx");
+  for my $i ($display_start_idx .. ($display_start_idx+$REPORT_LINES-1)) {
+    $cp = 0;
+    if ( $i > $#report_tokens ) {
+      $str = '~' . ' ' x ($COLS-2);
+      $report_win->attron(COLOR_PAIR($COLOR_EMPTY_LINE));
+      $report_win->attron(A_BOLD);
+      $report_win->addstr($line,0,$str);
+      $report_win->attroff(A_BOLD);
+      $report_win->attroff(COLOR_PAIR($COLOR_EMPTY_LINE));
+      $line++;
+      next;
+    }
+    &draw_report_line($i,$line,'with-selection');
+    $line++;
+  }
+  $report_win->refresh();
+  if ( $display_start_idx == 0 ) {
+    $cursor_position = 'Top';
+  } elsif ( $display_start_idx + $REPORT_LINES >= $#report_tokens + 1 ) {
+    $cursor_position = 'Bot';
+  } else {
+    $cursor_position = int($task_selected_idx/$#report_tokens*100) . '%';
+  }
+  CASE: {
+    if ( $error_msg ne '' ) {
+      &draw_error_msg();
+      last CASE;
+    }
+    if ( $feedback_msg ne '' ) {
+      &draw_feedback_msg();
+      last CASE;
+    }
+    if ( $input_mode eq 'search' && $search_direction == 1 ) {
+      &draw_prompt_line("/$search_pat");
+      last CASE;
+    }
+    if ( $input_mode eq 'search' && $search_direction == 0 ) {
+      &draw_prompt_line("?$search_pat");
+      last CASE;
+    }
+    &draw_prompt_line('');
+  }
+  if ( $flash_convergence ) {
+    if ( $burndown eq "yes" ) {
+      &flash_convergence();
+      $flash_convergence = 0;
+      $prev_convergence = $convergence;
+    }
+  }
+
+}
+
+
+########################################################
+## vitrc.pl...
+# Copyright 2013 - 2016, Scott Kostyshak
+
+sub parse_vitrc {
+  my $vitrc = glob("~/.vitrc");
+  if ( open(IN,"<$vitrc") ) {
+    while (<IN>) {
+      chop;
+      my $parse_error = "ERROR: incorrect key bind line in .vitrc:\n $_\n";
+      if ( $_ =~ s/^map // ) {
+        my($scut, $cmd) = split(/=/, $_, 2);
+
+        my $skey;
+        if ($scut =~ s/([^ ]+)$//) {
+          $skey = $1;
+        }
+        else {
+          print STDERR "$parse_error";
+          exit(1);
+        }
+
+        $skey = &replace_keycodes("$skey");
+        $cmd = &replace_keycodes("$cmd");
+
+        # TODO: get rid of the eval().
+        # This shouldn't be too hard, but I need to figure out what exactly is happening here.
+        $skey = eval "\"$skey\"";
+
+        $shortcuts{$skey} = $cmd;
+      }
+      elsif ( $_ =~ s/^set // ) {
+        my($configname, $configval) = split(/=/, $_, 2);
+        &audit("CONFIG: user requests to set '$configname' to '$configval'");
+        if ($configname eq "burndown") {
+          # TODO: fix code duplication (see below)
+          if (!&sanitycheck_bool($configval)) {
+            print STDERR "ERROR: boolean config variable '$configname' must ".
+                         "be set to 'yes' or 'no'.\n";
+            exit(1);
+          }
+          $burndown = $configval;
+        }
+        elsif ($configname eq "confirmation") {
+          # TODO: fix code duplication (see above)
+          if (!&sanitycheck_bool($configval)) {
+            print STDERR "ERROR: boolean config variable '$configname' must ".
+                         "be set to 'yes' or 'no'.\n";
+            exit(1);
+          }
+          $confirmation = ( $configval eq "yes" ? 1 : undef );
+        }
+        elsif ($configname eq "wait") {
+          # TODO: more code duplication
+          if (!&sanitycheck_bool($configval)) {
+            print STDERR "ERROR: boolean config variable '$configname' must ".
+                         "be set to 'yes' or 'no'.\n";
+            exit(1);
+          }
+          $nowait = ($configval eq "no");
+        }
+      }
+    }
+    close(IN);
+  }
+}
+
+#------------------------------------------------------------------
+
+sub replace_keycodes {
+  my $str_ = $_[0];
+
+  $str_ =~ s/<F1>/KEY_F(1)/e;
+  $str_ =~ s/<F2>/KEY_F(2)/e;
+  $str_ =~ s/<F3>/KEY_F(3)/e;
+  $str_ =~ s/<F4>/KEY_F(4)/e;
+  $str_ =~ s/<F5>/KEY_F(5)/e;
+  $str_ =~ s/<F6>/KEY_F(6)/e;
+  $str_ =~ s/<F7>/KEY_F(7)/e;
+  $str_ =~ s/<F8>/KEY_F(8)/e;
+  $str_ =~ s/<F9>/KEY_F(9)/e;
+  $str_ =~ s/<F10>/KEY_F(10)/e;
+  $str_ =~ s/<F11>/KEY_F(11)/e;
+  $str_ =~ s/<F12>/KEY_F(12)/e;
+
+  $str_ =~ s/<Home>/KEY_HOME/e;
+  $str_ =~ s/<End>/KEY_END/e;
+
+  $str_ =~ s/<Insert>/KEY_IC/e;
+  $str_ =~ s/<Del>/KEY_DC/e;
+
+  $str_ =~ s/<PageUp>/KEY_PPAGE/e;
+  $str_ =~ s/<PageDown>/KEY_NPAGE/e;
+
+  $str_ =~ s/<Up>/KEY_UP/e;
+  $str_ =~ s/<Down>/KEY_DOWN/e;
+  $str_ =~ s/<Right>/KEY_RIGHT/e;
+  $str_ =~ s/<Left>/KEY_LEFT/e;
+
+  $str_ =~ s/<Backspace>/KEY_BACKSPACE/e;
+
+  # We don't evaluate these ones (no 'e').
+  $str_ =~ s/<Space>/ /;
+  $str_ =~ s/<Tab>/\t/;
+  $str_ =~ s/<Return>/\n/;
+  $str_ =~ s/<Esc>/\e/;
+
+  return $str_;
+}
+
+#------------------------------------------------------------------
+
+sub sanitycheck_bool {
+  my $bool_ = $_[0];
+  if ($bool_ ne "yes" && $bool_ ne "no") {
+    return 0;
+  }
+  else {
+    return 1;
+  }
+}
+
+

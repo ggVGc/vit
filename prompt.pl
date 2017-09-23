@@ -1,3 +1,4 @@
+
 # Copyright 2012 - 2013, Steve Rader
 # Copyright 2013 - 2016, Scott Kostyshak
 
@@ -19,9 +20,15 @@ sub prompt_y {
 sub prompt_u8getch() {
   my $chr = $prompt_win->getch();
 
+
   my $cpt = ord($chr);
   if ($chr =~ /\A\d+\z/ || $cpt <= 127) {
-    return $chr;
+    if ($cpt eq 23) {
+      return 23;
+    }else{
+      return $chr;
+    }
+    
   }
   my $len=1;
      if (($cpt & 0xe0) == 0xc0) { $len = 2; }
@@ -110,7 +117,6 @@ sub prompt_str {
 
   while (1) {
     my $ch = prompt_u8getch();
-
     if ( $tab_started and $ch ne "\t"     and $ch ne KEY_BTAB
                       and $ch ne KEY_STAB and $ch ne KEY_RESIZE ) {
       # When a key other than tab is pressed, then stop the tabbing cycle.
@@ -135,6 +141,7 @@ sub prompt_str {
     if ( $ch eq "\n" ) {
       last;
     }
+    
     if ( $ch eq "\t" or $ch eq KEY_STAB or $ch eq KEY_BTAB ) {
       # handle tab completion
       if ( $mode ne 'cmd' and $mode ne 'project' and $mode ne 'tag' ) {
@@ -223,6 +230,27 @@ sub prompt_str {
         next;
       }
     }
+
+    if ($ch eq 23) {
+      # CTRL-W, delete word
+
+      if (length($str) > 0 and substr($str, length($str)-1) eq " ") {
+        $str = substr($str, 0, length($str)-2);
+      }
+      my $end = rindex($str," ");
+      if ($end eq -1) {
+        $str = "";
+        $cur_pos = $prompt_len;
+      }else{
+        
+        $str = substr($str, 0, $end);
+        $str = "$str ";
+        $cur_pos = $end + $prompt_len + 1;
+      }
+      &draw_prompt_cur("$prompt$str");
+      next;
+    }
+
     if ( $ch eq KEY_LEFT ) {
       if ( $cur_pos > $prompt_len ) {
         $cur_pos -= 1;
